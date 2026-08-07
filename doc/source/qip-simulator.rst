@@ -30,7 +30,7 @@ It corresponds to the following circuit:
 .. plot::
     :include-source: False
     :context: reset
-    
+
 
     from qutip_qip.circuit import QubitCircuit
     from qutip_qip.operations.gates import X, CX, CH, QASMU, TOFFOLI
@@ -47,7 +47,7 @@ It corresponds to the following circuit:
     qc.draw()
 
 
-    
+
 
 We will add the measurement gates later. This circuit prepares the W-state
 :math:`\newcommand{\ket}[1]{\left|{#1}\right\rangle} (\ket{001} + \ket{010} + \ket{100})/\sqrt{3}`.
@@ -283,7 +283,7 @@ followed just by measurement on the first qubit:
 .. testoutput::
     :options: +NORMALIZE_WHITESPACE
 
-    Quantum object: dims=[[2, 2, 2], [2, 2, 2]], shape=(8, 8), type='oper', dtype=Dense, isherm=True
+    Quantum object: dims=[[2, 2, 2], [2, 2, 2]], shape=(8, 8), type='oper', dtype=CSR, isherm=True
     Qobj data =
     [[0.      0.      0.      0.      0.      0.      0.      0.     ]
      [0.      0.33333 0.      0.      0.      0.      0.      0.     ]
