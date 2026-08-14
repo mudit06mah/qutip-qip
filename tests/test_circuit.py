@@ -27,7 +27,12 @@ from qutip_qip.circuit import (
 )
 from qutip_qip.circuit.draw import TeXRenderer
 from qutip_qip.decompose.decompose_single_qubit_gate import _ZYZ_rotation
-from qutip_qip.operations import Gate, Measurement, gate_sequence_product
+from qutip_qip.operations import (
+    Gate,
+    Measurement,
+    gate_sequence_product,
+    expand_operator,
+)
 import qutip_qip.operations.gates as gates
 from qutip_qip.operations.measurement import Mz
 from qutip_qip.transpiler import to_chain_structure
@@ -869,6 +874,62 @@ class TestEinsumBackend:
         finally:
             if dtype == "CuState":
                 qutip_cuquantum.set_as_default(reverse=True)
+
+    @pytest.mark.filterwarnings(
+        "ignore:ExternalStream is deprecated:DeprecationWarning"
+    )
+    @pytest.mark.parametrize("dtype", AVAILABLE_DTYPES)
+    def test_density_matrix_dtype_preservation(self, dtype):
+        """
+        Validate that the dtype of the density matrix state is preserved.
+        """
+        if dtype == "CuState":
+            pytest.skip("CuState is for state vectors")
+
+        qc = QubitCircuit(2)
+        qc.add_gate(gates.H, targets=0)
+        qc.add_gate(gates.CX, controls=0, targets=1)
+
+        state = ket2dm(tensor(basis(2, 0), basis(2, 0))).to(dtype)
+
+        sim = CircuitSimulator(qc, mode="density_matrix_simulator")
+        result = sim.run(state)
+
+        final_state = result.get_final_states()[0]
+
+        assert type(final_state.data) == type(state.data)
+
+    def test_density_matrix_einsum_evolution(self):
+        """
+        Test density matrix einsum evolution accuracy against operator expansion.
+        """
+        qc = QubitCircuit(3)
+        qc.add_gate(gates.H, targets=0)
+        qc.add_gate(gates.CX, controls=0, targets=1)
+        qc.add_gate(gates.TOFFOLI, controls=[0, 1], targets=2)
+
+        dm_init = qutip.rand_dm([2, 2, 2])
+
+        sim_dm = CircuitSimulator(qc, mode="density_matrix_simulator")
+        res_einsum = sim_dm.run(dm_init).get_final_states(0)
+
+        U_H_exp = expand_operator(gates.H.get_qobj(), dims=[2, 2, 2], targets=0)
+        U_CX_exp = expand_operator(gates.CX.get_qobj(), dims=[2, 2, 2], targets=[0, 1])
+        U_T_exp = expand_operator(
+            gates.TOFFOLI.get_qobj(), dims=[2, 2, 2], targets=[0, 1, 2]
+        )
+
+        expected_dm = (
+            U_T_exp
+            * U_CX_exp
+            * U_H_exp
+            * dm_init
+            * U_H_exp.dag()
+            * U_CX_exp.dag()
+            * U_T_exp.dag()
+        )
+
+        np.testing.assert_allclose(res_einsum.full(), expected_dm.full(), atol=1e-12)
 
 
 class TestAddGateError:

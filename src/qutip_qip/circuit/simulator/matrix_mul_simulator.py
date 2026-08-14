@@ -252,6 +252,8 @@ class CircuitSimulator:
                 return
             if self.mode == "state_vector_simulator":
                 state = self._evolve_state_einsum(gate, qubits, current_state)
+            elif self.mode == "density_matrix_simulator":
+                state = self._evolve_state_einsum_dm(gate, qubits, current_state)
             else:
                 state = self._evolve_state(gate, qubits, current_state)
 
@@ -263,39 +265,96 @@ class CircuitSimulator:
         self._state = state
         self._op_index += 1
 
-    def _generate_einsum_eq(self, targets, num_qubits):
+    def _generate_einsum_eq(self, targets, num_qubits, is_oper=False):
         """
         Generates the einsum string for tensor contraction supporting up to 52 qubits.
         Uses standard ASCII letters (a-z, A-Z) to map input and output indices.
 
         Parameters
         ----------
-        targets : list of int
+        targets : int or list of int
             The target qubits the gate acts on.
         num_qubits : int
             The total number of qubits (tensor dimensions) in the state.
+        is_oper : bool, optional
+            Whether the state is an operator (e.g. unitary matrix) or ket vector.
 
         Returns
         -------
         eq : str
             The einsum equation string (e.g., "ab,cde->cde").
         """
+        if isinstance(targets, int):
+            targets = [targets]
+
         chars = string.ascii_letters
 
-        state_in = list(chars[:num_qubits])
-        gate_out = list(chars[num_qubits : num_qubits + len(targets)])
+        row_in = list(chars[:num_qubits])
+        k = len(targets)
+        gate_out = list(chars[num_qubits : num_qubits + k])
+        gate_in = [row_in[t] for t in targets]
 
-        gate_in = [state_in[t] for t in targets]
-
-        state_out = state_in.copy()
+        row_out = row_in.copy()
         for i, t in enumerate(targets):
-            state_out[t] = gate_out[i]
+            row_out[t] = gate_out[i]
 
-        gate_str = "".join(gate_out + gate_in)
-        state_in_str = "".join(state_in)
-        state_out_str = "".join(state_out)
+        sub_gate = "".join(gate_out + gate_in)
 
-        return f"{gate_str}, {state_in_str}... -> {state_out_str}..."
+        if is_oper:
+            col_in = list(chars[num_qubits + k : 2 * num_qubits + k])
+            sub_state = "".join(row_in + col_in)
+            sub_out = "".join(row_out + col_in)
+        else:
+            col_char = chars[num_qubits + k]
+            sub_state = "".join(row_in) + col_char
+            sub_out = "".join(row_out) + col_char
+
+        return f"{sub_gate},{sub_state}->{sub_out}"
+
+    def _generate_dm_einsum_eq(self, targets, num_qubits):
+        r"""
+        Generates the einsum string for density matrix tensor contraction U rho U^\dagger.
+
+        Parameters
+        ----------
+        targets : int or list of int
+            The target qubits the gate acts on.
+        num_qubits : int
+            The total number of qubits in the state.
+
+        Returns
+        -------
+        eq : str
+            The einsum equation string (e.g., "ghac,abcdef,dfij->gbhiej").
+        """
+        if isinstance(targets, int):
+            targets = [targets]
+
+        chars = string.ascii_letters
+
+        row_in = list(chars[:num_qubits])
+        col_in = list(chars[num_qubits : 2 * num_qubits])
+
+        offset = 2 * num_qubits
+        k = len(targets)
+        gate_out_rows = list(chars[offset : offset + k])
+        gate_out_cols = list(chars[offset + k : offset + 2 * k])
+
+        gate_in_rows = [row_in[t] for t in targets]
+        gate_in_cols = [col_in[t] for t in targets]
+
+        row_out = row_in.copy()
+        col_out = col_in.copy()
+        for i, t in enumerate(targets):
+            row_out[t] = gate_out_rows[i]
+            col_out[t] = gate_out_cols[i]
+
+        sub_U = "".join(gate_out_rows + gate_in_rows)
+        sub_rho = "".join(row_in + col_in)
+        sub_Udag = "".join(gate_in_cols + gate_out_cols)
+        sub_out = "".join(row_out + col_out)
+
+        return f"{sub_U},{sub_rho},{sub_Udag}->{sub_out}"
 
     def _evolve_state(
         self, operation: Gate, targets_indices: int | IntSequence, state: Qobj
@@ -345,28 +404,67 @@ class CircuitSimulator:
         targets_indices : int or sequence of int
             The indices of the target qubits.
         state : :class:`qutip.Qobj`
-            The current quantum state vector.
+            The current quantum state vector or operator.
 
         Returns
         -------
         state : :class:`qutip.Qobj`
             The updated quantum state.
         """
-        gate_qobj = operation.get_qobj()
+        state_dtype = type(state.data).__name__
+        gate_dtype = "CuOperator" if state_dtype == "CuState" else state_dtype
+
+        gate_qobj = operation.get_qobj().to(gate_dtype)
 
         original_dims = state.dims
         original_shape = state.shape
-        data_type = type(state.data).__name__
 
-        # Generate equation
-        num_dims = len(self._tensor_dims)
-        eq = self._generate_einsum_eq(targets_indices, num_dims)
+        num_dims = len(self._state_dims[0])
+        is_oper = state.isoper
+        eq = self._generate_einsum_eq(targets_indices, num_dims, is_oper=is_oper)
 
         malformed_state = einsum(eq, gate_qobj, state)
         reshaped_data = _data.reshape(
             malformed_state.data, original_shape[0], original_shape[1]
         )
-        state = Qobj(reshaped_data, dims=original_dims).to(data_type)
+        state = Qobj(reshaped_data, dims=original_dims).to(state_dtype)
+
+        return state
+
+    def _evolve_state_einsum_dm(self, operation, targets_indices, state):
+        """
+        Applies a gate to the density matrix state using tensor contraction (einsum).
+
+        Parameters
+        ----------
+        operation : :class:`.Gate`
+            The quantum gate to be applied.
+        targets_indices : int or sequence of int
+            The indices of the target qubits.
+        state : :class:`qutip.Qobj`
+            The current quantum density matrix state.
+
+        Returns
+        -------
+        state : :class:`qutip.Qobj`
+            The updated quantum density matrix state.
+        """
+        state_dtype = type(state.data).__name__
+        gate_dtype = "CuOperator" if state_dtype == "CuState" else state_dtype
+
+        gate_qobj = operation.get_qobj().to(gate_dtype)
+
+        original_dims = state.dims
+        original_shape = state.shape
+
+        num_dims = len(self._state_dims[0])
+        eq = self._generate_dm_einsum_eq(targets_indices, num_dims)
+
+        malformed_state = einsum(eq, gate_qobj, state, gate_qobj.dag())
+        reshaped_data = _data.reshape(
+            malformed_state.data, original_shape[0], original_shape[1]
+        )
+        state = Qobj(reshaped_data, dims=original_dims).to(state_dtype)
 
         return state
 
