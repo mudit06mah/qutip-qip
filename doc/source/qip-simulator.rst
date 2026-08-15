@@ -348,3 +348,82 @@ One can save it in a ``.qasm`` file and import it using the following code:
     from qutip_qip.qasm import read_qasm
 
     qc = read_qasm("source/w-state.qasm")
+
+
+GPU-accelerated and Tensor-based Simulation
+===========================================
+
+What if you want to simulate a huge circuit with 20+ qubits? Traditional matrix
+multiplication can become a memory-guzzling bottleneck because expanding the
+gates to the full Hilbert space creates massive matrices.
+
+To save the day, the :class:`.CircuitSimulator` uses tensor contraction
+(Einstein summation, or ``einsum``) by default for both state vector and
+density matrix simulations. Instead of expanding gates, it contracts the gate
+directly with the target qubits.
+
+Even better, we can pair this with GPU backends to turbocharge the simulation!
+Note that because of GPU data transfer and compilation overheads, you will
+typically see a speedup for large circuits (specifically 20+ qubits) compared
+to standard CPU simulation.
+
+Using JAX (CPU/GPU)
+-------------------
+
+With `qutip-jax <https://github.com/qutip/qutip-jax>`_, we can run simulations
+using JAX's JIT compiler. Simply convert your state to a JAX array:
+
+.. code-block:: python
+
+    import qutip_jax
+    from qutip import tensor, basis
+    from qutip_qip.circuit import QubitCircuit, CircuitSimulator
+    import qutip_qip.operations.gates as gates
+
+    # Create a 20-qubit circuit
+    qc = QubitCircuit(20)
+    qc.add_gate(gates.H, targets=0)
+    for q in range(19):
+        qc.add_gate(gates.CX, controls=q, targets=q+1)
+
+    # Convert initial state to JAX
+    state = tensor([basis(2, 0)] * 20).to("jax")
+
+    sim = CircuitSimulator(qc, mode="state_vector_simulator")
+
+    # First run compiles the circuit (takes a moment)
+    _ = sim.run(state)
+
+    # Second run is lightning fast on your GPU!
+    result = sim.run(state)
+
+Using cuQuantum (GPU)
+---------------------
+
+For NVIDIA GPU enthusiasts, `qutip-cuquantum <https://github.com/qutip/qutip-cuquantum>`_
+links directly with NVIDIA's cuQuantum SDK for state-vector simulations.
+
+.. code-block:: python
+
+    import qutip_cuquantum
+    from cuquantum.densitymat import WorkStream
+    from qutip import tensor, basis
+    from qutip_qip.circuit import QubitCircuit, CircuitSimulator
+    import qutip_qip.operations.gates as gates
+
+    # Set up the cuQuantum default context
+    qutip_cuquantum.set_as_default(WorkStream())
+
+    try:
+        qc = QubitCircuit(20)
+        qc.add_gate(gates.H, targets=0)
+        for q in range(19):
+            qc.add_gate(gates.CX, controls=q, targets=q+1)
+
+        # Convert to CuState for GPU simulation
+        state = tensor([basis(2, 0)] * 20).to("CuState")
+
+        sim = CircuitSimulator(qc, mode="state_vector_simulator")
+        result = sim.run(state)
+    finally:
+        qutip_cuquantum.set_as_default(reverse=True)
