@@ -412,7 +412,10 @@ class CircuitSimulator:
             The updated quantum state.
         """
         state_dtype = type(state.data).__name__
-        gate_dtype = "CuOperator" if state_dtype == "CuState" else state_dtype
+        if state_dtype == "CuState":
+            return self._evolve_state(operation, targets_indices, state)
+
+        gate_dtype = state_dtype
 
         gate_qobj = operation.get_qobj().to(gate_dtype)
 
@@ -450,7 +453,10 @@ class CircuitSimulator:
             The updated quantum density matrix state.
         """
         state_dtype = type(state.data).__name__
-        gate_dtype = "CuOperator" if state_dtype == "CuState" else state_dtype
+        if state_dtype == "CuState":
+            return self._evolve_state(operation, targets_indices, state)
+
+        gate_dtype = state_dtype
 
         gate_qobj = operation.get_qobj().to(gate_dtype)
 
