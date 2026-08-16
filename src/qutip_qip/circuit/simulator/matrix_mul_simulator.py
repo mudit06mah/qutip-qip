@@ -2,6 +2,7 @@ from itertools import product
 from operator import mul
 from functools import reduce
 from typing import Type
+import string
 import numpy as np
 import string
 
@@ -244,9 +245,14 @@ class CircuitSimulator:
         if self.qc.instructions[self._op_index].is_measurement_instruction():
             targets = circ_instruction.qubits
             classical_store = circ_instruction.cbits
-            state = self._apply_measurement(
-                circ_instruction.operation, targets, classical_store
-            )
+            if self.mode in ("state_vector_simulator", "density_matrix_simulator"):
+                state = self._apply_measurement_einsum(
+                    circ_instruction.operation, targets, classical_store
+                )
+            else:
+                state = self._apply_measurement(
+                    circ_instruction.operation, targets, classical_store
+                )
 
         elif self.qc.instructions[self._op_index].is_gate_instruction():
             gate = circ_instruction.operation
@@ -571,6 +577,93 @@ class CircuitSimulator:
             states = list(filter(lambda x: x is not None, states))
             probabilities = list(filter(lambda x: x != 0, probabilities))
             state = sum(p * s for s, p in zip(states, probabilities))
+
+        else:
+            raise NotImplementedError(f"mode {self.mode} is not available.")
+
+        return state
+
+    def _apply_measurement_einsum(
+        self,
+        operation: Measurement,
+        qubits: tuple[int, ...],
+        cbits: tuple[int, ...],
+    ) -> Qobj:
+        """
+        Applies measurement gate specified by operation using tensor contraction (einsum).
+        """
+        current_state = self.state
+        num_qubits = self.qc.num_qubits
+        if isinstance(operation, type) and issubclass(operation, Measurement):
+            operation = operation()
+
+        state_dtype = type(current_state.data).__name__
+        op_dtype = "CuOperator" if state_dtype == "CuState" else state_dtype
+
+        raw_ops = [op.to(op_dtype) for op in operation.get_measurement_ops()]
+
+        states = []
+        probabilities = []
+        tol = qutip.settings.core["atol"]
+
+        if self.mode == "state_vector_simulator":
+            eq = self._generate_einsum_eq(
+                qubits, num_qubits, is_oper=current_state.isoper
+            )
+
+            for op in raw_ops:
+                unnorm_state = einsum(eq, op, current_state)
+                p = float(np.real(unnorm_state.overlap(unnorm_state)))
+
+                if p >= tol:
+                    states.append(unnorm_state / np.sqrt(p))
+                    probabilities.append(p)
+                else:
+                    states.append(None)
+                    probabilities.append(0.0)
+
+            if self._measure_results:
+                i = int(self._measure_results[self._measure_ind])
+                self._measure_ind += 1
+            else:
+                prob_sum = sum(probabilities)
+                if prob_sum > 0:
+                    norm_probs = [p / prob_sum for p in probabilities]
+                else:
+                    norm_probs = [1.0 / len(probabilities)] * len(probabilities)
+                i = np.random.choice(len(probabilities), p=norm_probs)
+
+            self._probability *= probabilities[i]
+            state = states[i]
+            if cbits:
+                cbit_index = cbits[0]
+                self.cbits[cbit_index] = i
+
+        elif self.mode == "density_matrix_simulator":
+            eq = self._generate_dm_einsum_eq(qubits, num_qubits)
+            unnorm_states = []
+
+            for op in raw_ops:
+                unnorm_rho = einsum(eq, op, current_state, op.dag())
+                p = float(np.real(unnorm_rho.tr()))
+
+                if p >= tol:
+                    states.append(unnorm_rho / p)
+                    probabilities.append(p)
+                    unnorm_states.append(unnorm_rho)
+                else:
+                    states.append(None)
+                    probabilities.append(0.0)
+
+            if self._measure_results:
+                i = int(self._measure_results[self._measure_ind])
+                self._measure_ind += 1
+                self._probability *= probabilities[i]
+                state = states[i]
+                if cbits:
+                    self.cbits[cbits[0]] = i
+            else:
+                state = sum(unnorm_states) if unnorm_states else current_state
 
         else:
             raise NotImplementedError(f"mode {self.mode} is not available.")
