@@ -931,6 +931,71 @@ class TestEinsumBackend:
 
         np.testing.assert_allclose(res_einsum.full(), expected_dm.full(), atol=1e-12)
 
+    @pytest.mark.skipif(not HAS_CUQANTUM, reason="qutip_cuquantum not installed")
+    @pytest.mark.filterwarnings(
+        "ignore:ExternalStream is deprecated:DeprecationWarning"
+    )
+    def test_cuquantum_state_vector_simulator(self):
+        """Test state_vector_simulator mode with CuState on GPU."""
+        import qutip_cuquantum
+        from cuquantum.densitymat import WorkStream
+
+        ctx = WorkStream()
+        qutip_cuquantum.set_as_default(ctx)
+        try:
+            qc = QubitCircuit(2)
+            qc.add_gate(gates.H, targets=0)
+            qc.add_gate(gates.CX, controls=0, targets=1)
+
+            state = tensor(basis(2, 0), basis(2, 0)).to("CuState")
+            sim = CircuitSimulator(qc, mode="state_vector_simulator")
+            result = sim.run(state)
+
+            final_state = result.get_final_states()[0]
+            assert type(final_state.data).__name__ == "CuState"
+
+            expected = (
+                tensor(basis(2, 0), basis(2, 0)) + tensor(basis(2, 1), basis(2, 1))
+            ).unit()
+            np.testing.assert_allclose(final_state.full(), expected.full(), atol=1e-12)
+        finally:
+            qutip_cuquantum.set_as_default(reverse=True)
+
+    @pytest.mark.skipif(not HAS_CUQANTUM, reason="qutip_cuquantum not installed")
+    @pytest.mark.filterwarnings(
+        "ignore:ExternalStream is deprecated:DeprecationWarning"
+    )
+    def test_cuquantum_density_matrix_simulator(self):
+        """Test density_matrix_simulator mode with CuState on GPU."""
+        import qutip_cuquantum
+        from cuquantum.densitymat import WorkStream
+
+        ctx = WorkStream()
+        qutip_cuquantum.set_as_default(ctx)
+        try:
+            qc = QubitCircuit(2)
+            qc.add_gate(gates.H, targets=0)
+            qc.add_gate(gates.CX, controls=0, targets=1)
+
+            pure_state = tensor(basis(2, 0), basis(2, 0)).to("CuState")
+            state = ket2dm(pure_state)
+            assert type(state.data).__name__ == "CuState"
+
+            sim = CircuitSimulator(qc, mode="density_matrix_simulator")
+            result = sim.run(state)
+
+            final_state = result.get_final_states()[0]
+            assert type(final_state.data).__name__ == "CuState"
+
+            expected = ket2dm(
+                (
+                    tensor(basis(2, 0), basis(2, 0)) + tensor(basis(2, 1), basis(2, 1))
+                ).unit()
+            )
+            np.testing.assert_allclose(final_state.full(), expected.full(), atol=1e-12)
+        finally:
+            qutip_cuquantum.set_as_default(reverse=True)
+
 
 class TestAddGateError:
     def test_add_gate_errors(self):

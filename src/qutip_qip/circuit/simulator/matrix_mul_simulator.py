@@ -103,9 +103,19 @@ class CircuitSimulator:
             else:
                 state = np.exp(1j * self.qc.global_phase) * state
                 self._state = state
+
+            if type(self._state.data).__name__ == "CuState":
+                from qutip_cuquantum.state import CuState as CuStateClass
+
+                hilbert_dims = tuple(state.dims[0])
+                self._state = Qobj(
+                    CuStateClass(self._state.data.to_cupy(), hilbert_dims=hilbert_dims),
+                    dims=self._state.dims,
+                )
         else:
             # Just computing the full unitary, no state
             self._state = None
+
         self._state_dims = state.dims.copy()  # Record the dimension of the state.
         self._probability = 1
         self._op_index = 0
@@ -379,11 +389,26 @@ class CircuitSimulator:
         state_dtype = type(state.data).__name__
         gate_dtype = "CuOperator" if state_dtype == "CuState" else state_dtype
 
-        U = operation.get_qobj().to(gate_dtype)
+        if gate_dtype == "CuOperator":
+            from qutip_cuquantum.operator import CuOperator as CuOperatorClass
+
+            gate_qobj = operation.get_qobj()
+            U = Qobj(
+                CuOperatorClass(
+                    gate_qobj.data,
+                    hilbert_dims=tuple(gate_qobj.dims[0]),
+                    mode=tuple(range(len(gate_qobj.dims[0]))),
+                ),
+                dims=gate_qobj.dims,
+            )
+        else:
+            U = operation.get_qobj().to(gate_dtype)
+
         U = expand_operator(
             U,
             dims=self.dims,
             targets=targets_indices,
+            dtype=gate_dtype,
         )
         if self.mode == "state_vector_simulator":
             state = U * state
