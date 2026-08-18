@@ -612,7 +612,10 @@ class CircuitSimulator:
             )
 
             for op in raw_ops:
-                unnorm_state = einsum(eq, op, current_state)
+                if state_dtype == "CuState":
+                    unnorm_state = self._evolve_state(op, qubits, current_state)
+                else:
+                    unnorm_state = einsum(eq, op, current_state)
                 p = float(np.real(unnorm_state.overlap(unnorm_state)))
 
                 if p >= tol:
@@ -644,7 +647,10 @@ class CircuitSimulator:
             unnorm_states = []
 
             for op in raw_ops:
-                unnorm_rho = einsum(eq, op, current_state, op.dag())
+                if state_dtype == "CuState":
+                    unnorm_rho = self._evolve_state(op, qubits, current_state)
+                else:
+                    unnorm_rho = einsum(eq, op, current_state, op.dag())
                 p = float(np.real(unnorm_rho.tr()))
 
                 if p >= tol:
