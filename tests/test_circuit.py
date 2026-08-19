@@ -847,22 +847,26 @@ class TestEinsumBackend:
         "ignore:ExternalStream is deprecated:DeprecationWarning"
     )
     @pytest.mark.parametrize("dtype", AVAILABLE_DTYPES)
-    def test_dtype_preservation(self, dtype):
+    def test_state_vector_einsum_evolution(self, dtype):
         """
-        Validate that the dtype of the input state is preserved.
+        Test state vector einsum evolution with inverted & non-contiguous gate targets.
         """
         if dtype == "CuState":
             import qutip_cuquantum
             from cuquantum.densitymat import WorkStream
 
-            # Set the WorkStream as the default context for the backend
             qutip_cuquantum.set_as_default(WorkStream())
 
         try:
-            qc = QubitCircuit(1)
-            qc.add_gate(gates.X, targets=0)
+            # 3-qubit circuit testing non-contiguous AND inverted target orderings:
+            # CX acting on (2, 0) and TOFFOLI acting on controls=[2, 0] -> target=1
+            qc = QubitCircuit(3)
+            qc.add_gate(gates.H, targets=0)
+            qc.add_gate(gates.CX, controls=2, targets=0)
+            qc.add_gate(gates.TOFFOLI, controls=[2, 0], targets=1)
 
-            state = basis(2, 0).to(dtype)
+            init_state_cpu = tensor(basis(2, 0), basis(2, 0), basis(2, 1))
+            state = init_state_cpu.to(dtype)
 
             sim = CircuitSimulator(qc, mode="state_vector_simulator")
             result = sim.run(state)
@@ -870,6 +874,22 @@ class TestEinsumBackend:
             final_state = result.get_final_states()[0]
 
             assert type(final_state.data) == type(state.data)
+
+            if dtype == "CuState":
+                qutip_cuquantum.set_as_default(reverse=True)
+
+            U_H_exp = expand_operator(gates.H.get_qobj(), dims=[2, 2, 2], targets=0)
+            U_CX_exp = expand_operator(
+                gates.CX.get_qobj(), dims=[2, 2, 2], targets=[2, 0]
+            )
+            U_T_exp = expand_operator(
+                gates.TOFFOLI.get_qobj(), dims=[2, 2, 2], targets=[2, 0, 1]
+            )
+
+            expected_state = U_T_exp * U_CX_exp * U_H_exp * init_state_cpu
+            np.testing.assert_allclose(
+                final_state.full(), expected_state.full(), atol=1e-12
+            )
 
         finally:
             if dtype == "CuState":
@@ -879,122 +899,105 @@ class TestEinsumBackend:
         "ignore:ExternalStream is deprecated:DeprecationWarning"
     )
     @pytest.mark.parametrize("dtype", AVAILABLE_DTYPES)
-    def test_density_matrix_dtype_preservation(self, dtype):
+    def test_density_matrix_einsum_evolution(self, dtype):
         """
-        Validate that the dtype of the density matrix state is preserved.
+        Test density matrix einsum evolution with inverted & non-contiguous gate targets.
         """
         if dtype == "CuState":
-            pytest.skip("CuState is for state vectors")
+            import qutip_cuquantum
+            from cuquantum.densitymat import WorkStream
 
-        qc = QubitCircuit(2)
-        qc.add_gate(gates.H, targets=0)
-        qc.add_gate(gates.CX, controls=0, targets=1)
+            qutip_cuquantum.set_as_default(WorkStream())
 
-        state = ket2dm(tensor(basis(2, 0), basis(2, 0))).to(dtype)
-
-        sim = CircuitSimulator(qc, mode="density_matrix_simulator")
-        result = sim.run(state)
-
-        final_state = result.get_final_states()[0]
-
-        assert type(final_state.data) == type(state.data)
-
-    def test_density_matrix_einsum_evolution(self):
-        """
-        Test density matrix einsum evolution accuracy against operator expansion.
-        """
-        qc = QubitCircuit(3)
-        qc.add_gate(gates.H, targets=0)
-        qc.add_gate(gates.CX, controls=0, targets=1)
-        qc.add_gate(gates.TOFFOLI, controls=[0, 1], targets=2)
-
-        dm_init = qutip.rand_dm([2, 2, 2])
-
-        sim_dm = CircuitSimulator(qc, mode="density_matrix_simulator")
-        res_einsum = sim_dm.run(dm_init).get_final_states(0)
-
-        U_H_exp = expand_operator(gates.H.get_qobj(), dims=[2, 2, 2], targets=0)
-        U_CX_exp = expand_operator(gates.CX.get_qobj(), dims=[2, 2, 2], targets=[0, 1])
-        U_T_exp = expand_operator(
-            gates.TOFFOLI.get_qobj(), dims=[2, 2, 2], targets=[0, 1, 2]
-        )
-
-        expected_dm = (
-            U_T_exp
-            * U_CX_exp
-            * U_H_exp
-            * dm_init
-            * U_H_exp.dag()
-            * U_CX_exp.dag()
-            * U_T_exp.dag()
-        )
-
-        np.testing.assert_allclose(res_einsum.full(), expected_dm.full(), atol=1e-12)
-
-    @pytest.mark.skipif(not HAS_CUQANTUM, reason="qutip_cuquantum not installed")
-    @pytest.mark.filterwarnings(
-        "ignore:ExternalStream is deprecated:DeprecationWarning"
-    )
-    def test_cuquantum_state_vector_simulator(self):
-        """Test state_vector_simulator mode with CuState on GPU."""
-        import qutip_cuquantum
-        from cuquantum.densitymat import WorkStream
-
-        ctx = WorkStream()
-        qutip_cuquantum.set_as_default(ctx)
         try:
-            qc = QubitCircuit(2)
+            qc = QubitCircuit(3)
             qc.add_gate(gates.H, targets=0)
-            qc.add_gate(gates.CX, controls=0, targets=1)
+            qc.add_gate(gates.CX, controls=2, targets=0)
+            qc.add_gate(gates.TOFFOLI, controls=[2, 0], targets=1)
 
-            state = tensor(basis(2, 0), basis(2, 0)).to("CuState")
-            sim = CircuitSimulator(qc, mode="state_vector_simulator")
-            result = sim.run(state)
+            dm_init_cpu = ket2dm(tensor(basis(2, 0), basis(2, 0), basis(2, 1)))
+            dm_init = dm_init_cpu.to(dtype)
 
-            final_state = result.get_final_states()[0]
-            assert type(final_state.data).__name__ == "CuState"
+            sim_dm = CircuitSimulator(qc, mode="density_matrix_simulator")
+            res_einsum = sim_dm.run(dm_init).get_final_states(0)
 
-            expected = (
-                tensor(basis(2, 0), basis(2, 0)) + tensor(basis(2, 1), basis(2, 1))
-            ).unit()
-            np.testing.assert_allclose(final_state.full(), expected.full(), atol=1e-12)
-        finally:
-            qutip_cuquantum.set_as_default(reverse=True)
+            assert type(res_einsum.data) == type(dm_init.data)
 
-    @pytest.mark.skipif(not HAS_CUQANTUM, reason="qutip_cuquantum not installed")
-    @pytest.mark.filterwarnings(
-        "ignore:ExternalStream is deprecated:DeprecationWarning"
-    )
-    def test_cuquantum_density_matrix_simulator(self):
-        """Test density_matrix_simulator mode with CuState on GPU."""
-        import qutip_cuquantum
-        from cuquantum.densitymat import WorkStream
+            if dtype == "CuState":
+                qutip_cuquantum.set_as_default(reverse=True)
 
-        ctx = WorkStream()
-        qutip_cuquantum.set_as_default(ctx)
-        try:
-            qc = QubitCircuit(2)
-            qc.add_gate(gates.H, targets=0)
-            qc.add_gate(gates.CX, controls=0, targets=1)
-
-            pure_state = tensor(basis(2, 0), basis(2, 0)).to("CuState")
-            state = ket2dm(pure_state)
-            assert type(state.data).__name__ == "CuState"
-
-            sim = CircuitSimulator(qc, mode="density_matrix_simulator")
-            result = sim.run(state)
-
-            final_state = result.get_final_states()[0]
-            assert type(final_state.data).__name__ == "CuState"
-
-            expected = ket2dm(
-                (
-                    tensor(basis(2, 0), basis(2, 0)) + tensor(basis(2, 1), basis(2, 1))
-                ).unit()
+            U_H_exp = expand_operator(gates.H.get_qobj(), dims=[2, 2, 2], targets=0)
+            U_CX_exp = expand_operator(
+                gates.CX.get_qobj(), dims=[2, 2, 2], targets=[2, 0]
             )
-            np.testing.assert_allclose(final_state.full(), expected.full(), atol=1e-12)
+            U_T_exp = expand_operator(
+                gates.TOFFOLI.get_qobj(), dims=[2, 2, 2], targets=[2, 0, 1]
+            )
+
+            expected_dm = (
+                U_T_exp
+                * U_CX_exp
+                * U_H_exp
+                * dm_init_cpu
+                * U_H_exp.dag()
+                * U_CX_exp.dag()
+                * U_T_exp.dag()
+            )
+
+            np.testing.assert_allclose(
+                res_einsum.full(), expected_dm.full(), atol=1e-12
+            )
         finally:
-            qutip_cuquantum.set_as_default(reverse=True)
+            if dtype == "CuState":
+                qutip_cuquantum.set_as_default(reverse=True)
+
+    @pytest.mark.filterwarnings(
+        "ignore:ExternalStream is deprecated:DeprecationWarning"
+    )
+    @pytest.mark.parametrize("dtype", AVAILABLE_DTYPES)
+    def test_operator_einsum_evolution(self, dtype):
+        """
+        Test unitary operator matrix propagation (is_oper=True) through einsum with inverted targets.
+        """
+        if dtype == "CuState":
+            pytest.skip(
+                "CuState is for quantum state vectors/DMs, not general full operator matrices"
+            )
+
+        try:
+            qc = QubitCircuit(3)
+            qc.add_gate(gates.H, targets=0)
+            qc.add_gate(gates.CX, controls=2, targets=0)
+            qc.add_gate(gates.TOFFOLI, controls=[2, 0], targets=1)
+
+            init_oper_cpu = identity([2, 2, 2])
+            oper = init_oper_cpu.to(dtype)
+
+            sim = CircuitSimulator(qc, mode="state_vector_simulator")
+            res_einsum = sim.run(oper).get_final_states(0)
+
+            assert res_einsum.isoper
+            assert type(res_einsum.data) == type(oper.data)
+
+            if dtype == "CuState":
+                qutip_cuquantum.set_as_default(reverse=True)
+
+            U_H_exp = expand_operator(gates.H.get_qobj(), dims=[2, 2, 2], targets=0)
+            U_CX_exp = expand_operator(
+                gates.CX.get_qobj(), dims=[2, 2, 2], targets=[2, 0]
+            )
+            U_T_exp = expand_operator(
+                gates.TOFFOLI.get_qobj(), dims=[2, 2, 2], targets=[2, 0, 1]
+            )
+
+            expected_oper = U_T_exp * U_CX_exp * U_H_exp * init_oper_cpu
+
+            np.testing.assert_allclose(
+                res_einsum.full(), expected_oper.full(), atol=1e-12
+            )
+        finally:
+            if dtype == "CuState":
+                qutip_cuquantum.set_as_default(reverse=True)
 
 
 class TestAddGateError:
