@@ -104,6 +104,7 @@ class CircuitSimulator:
                 state = np.exp(1j * self.qc.global_phase) * state
                 self._state = state
 
+            # Reconstruct CuState with multipartite hilbert_dims for CuOperator mode mapping
             if type(self._state.data).__name__ == "CuState":
                 from qutip_cuquantum.state import CuState as CuStateClass
 
@@ -275,7 +276,9 @@ class CircuitSimulator:
         self._state = state
         self._op_index += 1
 
-    def _generate_einsum_eq(self, targets, num_qubits, is_oper=False):
+    def _generate_einsum_eq(
+        self, targets: int | IntSequence, num_qubits: int, is_oper: bool = False
+    ) -> str:
         """
         Generates the einsum string for tensor contraction supporting up to 52 qubits.
         Uses standard ASCII letters (a-z, A-Z) to map input and output indices.
@@ -321,7 +324,9 @@ class CircuitSimulator:
 
         return f"{sub_gate},{sub_state}->{sub_out}"
 
-    def _generate_dm_einsum_eq(self, targets, num_qubits):
+    def _generate_dm_einsum_eq(
+        self, targets: int | IntSequence, num_qubits: int
+    ) -> str:
         r"""
         Generates the einsum string for density matrix tensor contraction U rho U^\dagger.
 
@@ -389,6 +394,9 @@ class CircuitSimulator:
         state_dtype = type(state.data).__name__
         gate_dtype = "CuOperator" if state_dtype == "CuState" else state_dtype
 
+        # Construct CuOperator with explicit hilbert_dims and target mode mapping
+        # so cuQuantum knows which qubit sites to act on (calling .to('CuOperator')
+        # on raw gate Qobjs loses multipartite mode information).
         if gate_dtype == "CuOperator":
             from qutip_cuquantum.operator import CuOperator as CuOperatorClass
 
@@ -418,7 +426,9 @@ class CircuitSimulator:
             raise NotImplementedError(f"mode {self.mode} is not available.")
         return state
 
-    def _evolve_state_einsum(self, operation, targets_indices, state):
+    def _evolve_state_einsum(
+        self, operation: Gate, targets_indices: int | IntSequence, state: Qobj
+    ) -> Qobj:
         """
         Applies a gate to the state using tensor contraction (einsum).
 
@@ -437,6 +447,8 @@ class CircuitSimulator:
             The updated quantum state.
         """
         state_dtype = type(state.data).__name__
+        # There is no einsum specialisation registered for CuState/CuOperator, so einsum
+        # falls back to CPU NumPy. We route to matrix mul (_evolve_state) to stay on GPU.
         if state_dtype == "CuState":
             return self._evolve_state(operation, targets_indices, state)
 
@@ -459,7 +471,9 @@ class CircuitSimulator:
 
         return state
 
-    def _evolve_state_einsum_dm(self, operation, targets_indices, state):
+    def _evolve_state_einsum_dm(
+        self, operation: Gate, targets_indices: int | IntSequence, state: Qobj
+    ) -> Qobj:
         """
         Applies a gate to the density matrix state using tensor contraction (einsum).
 
@@ -478,6 +492,8 @@ class CircuitSimulator:
             The updated quantum density matrix state.
         """
         state_dtype = type(state.data).__name__
+        # There is no einsum specialisation registered for CuState/CuOperator, so einsum
+        # falls back to CPU NumPy. We route to matrix mul (_evolve_state) to stay on GPU.
         if state_dtype == "CuState":
             return self._evolve_state(operation, targets_indices, state)
 

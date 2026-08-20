@@ -48,9 +48,9 @@ except ImportError:
 try:
     import qutip_cuquantum
 
-    HAS_CUQANTUM = True
+    HAS_CUQUANTUM = True
 except ImportError:
-    HAS_CUQANTUM = False
+    HAS_CUQUANTUM = False
 
 
 def _op_dist(A, B):
@@ -840,7 +840,7 @@ class TestEinsumBackend:
     AVAILABLE_DTYPES = ["Dense"]
     if HAS_JAX:
         AVAILABLE_DTYPES.append("jax")
-    if HAS_CUQANTUM:
+    if HAS_CUQUANTUM:
         AVAILABLE_DTYPES.append("CuState")
 
     @pytest.mark.filterwarnings(
@@ -873,8 +873,11 @@ class TestEinsumBackend:
 
             final_state = result.get_final_states()[0]
 
-            assert type(final_state.data) == type(state.data)
+            assert type(final_state.data) is type(state.data)
 
+            # Switch back to CPU before computing analytical baseline matrices.
+            # Otherwise, expand_operator creates CuOperator instances where .permute()
+            # fails on non-contiguous/inverted targets (e.g. CX on [2, 0]).
             if dtype == "CuState":
                 qutip_cuquantum.set_as_default(reverse=True)
 
@@ -921,8 +924,11 @@ class TestEinsumBackend:
             sim_dm = CircuitSimulator(qc, mode="density_matrix_simulator")
             res_einsum = sim_dm.run(dm_init).get_final_states(0)
 
-            assert type(res_einsum.data) == type(dm_init.data)
+            assert type(res_einsum.data) is type(dm_init.data)
 
+            # Switch back to CPU before computing analytical baseline matrices.
+            # Otherwise, expand_operator creates CuOperator instances where .permute()
+            # fails on non-contiguous/inverted targets (e.g. CX on [2, 0]).
             if dtype == "CuState":
                 qutip_cuquantum.set_as_default(reverse=True)
 
@@ -964,40 +970,29 @@ class TestEinsumBackend:
                 "CuState is for quantum state vectors/DMs, not general full operator matrices"
             )
 
-        try:
-            qc = QubitCircuit(3)
-            qc.add_gate(gates.H, targets=0)
-            qc.add_gate(gates.CX, controls=2, targets=0)
-            qc.add_gate(gates.TOFFOLI, controls=[2, 0], targets=1)
+        qc = QubitCircuit(3)
+        qc.add_gate(gates.H, targets=0)
+        qc.add_gate(gates.CX, controls=2, targets=0)
+        qc.add_gate(gates.TOFFOLI, controls=[2, 0], targets=1)
 
-            init_oper_cpu = identity([2, 2, 2])
-            oper = init_oper_cpu.to(dtype)
+        init_oper_cpu = identity([2, 2, 2])
+        oper = init_oper_cpu.to(dtype)
 
-            sim = CircuitSimulator(qc, mode="state_vector_simulator")
-            res_einsum = sim.run(oper).get_final_states(0)
+        sim = CircuitSimulator(qc, mode="state_vector_simulator")
+        res_einsum = sim.run(oper).get_final_states(0)
 
-            assert res_einsum.isoper
-            assert type(res_einsum.data) == type(oper.data)
+        assert res_einsum.isoper
+        assert type(res_einsum.data) is type(oper.data)
 
-            if dtype == "CuState":
-                qutip_cuquantum.set_as_default(reverse=True)
+        U_H_exp = expand_operator(gates.H.get_qobj(), dims=[2, 2, 2], targets=0)
+        U_CX_exp = expand_operator(gates.CX.get_qobj(), dims=[2, 2, 2], targets=[2, 0])
+        U_T_exp = expand_operator(
+            gates.TOFFOLI.get_qobj(), dims=[2, 2, 2], targets=[2, 0, 1]
+        )
 
-            U_H_exp = expand_operator(gates.H.get_qobj(), dims=[2, 2, 2], targets=0)
-            U_CX_exp = expand_operator(
-                gates.CX.get_qobj(), dims=[2, 2, 2], targets=[2, 0]
-            )
-            U_T_exp = expand_operator(
-                gates.TOFFOLI.get_qobj(), dims=[2, 2, 2], targets=[2, 0, 1]
-            )
+        expected_oper = U_T_exp * U_CX_exp * U_H_exp * init_oper_cpu
 
-            expected_oper = U_T_exp * U_CX_exp * U_H_exp * init_oper_cpu
-
-            np.testing.assert_allclose(
-                res_einsum.full(), expected_oper.full(), atol=1e-12
-            )
-        finally:
-            if dtype == "CuState":
-                qutip_cuquantum.set_as_default(reverse=True)
+        np.testing.assert_allclose(res_einsum.full(), expected_oper.full(), atol=1e-12)
 
 
 class TestAddGateError:
