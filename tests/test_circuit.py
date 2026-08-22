@@ -27,11 +27,30 @@ from qutip_qip.circuit import (
 )
 from qutip_qip.circuit.draw import TeXRenderer
 from qutip_qip.decompose.decompose_single_qubit_gate import _ZYZ_rotation
-from qutip_qip.operations import Gate, Measurement, gate_sequence_product
+from qutip_qip.operations import (
+    Gate,
+    Measurement,
+    gate_sequence_product,
+    expand_operator,
+)
 import qutip_qip.operations.gates as gates
 from qutip_qip.operations.measurement import Mz
 from qutip_qip.transpiler import to_chain_structure
 from qutip_qip.qasm import read_qasm
+
+try:
+    import qutip_jax
+
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
+
+try:
+    import qutip_cuquantum
+
+    HAS_CUQUANTUM = True
+except ImportError:
+    HAS_CUQUANTUM = False
 
 
 def _op_dist(A, B):
@@ -811,6 +830,169 @@ class TestQubitCircuit:
 
         assert qc2.reverse_states is True
         assert qc2.input_states == [None] * 3
+
+
+class TestEinsumBackend:
+    """
+    Test suite for the einsum execution path and backend data types.
+    """
+
+    AVAILABLE_DTYPES = ["Dense"]
+    if HAS_JAX:
+        AVAILABLE_DTYPES.append("jax")
+    if HAS_CUQUANTUM:
+        AVAILABLE_DTYPES.append("CuState")
+
+    @pytest.mark.filterwarnings(
+        "ignore:ExternalStream is deprecated:DeprecationWarning"
+    )
+    @pytest.mark.parametrize("dtype", AVAILABLE_DTYPES)
+    def test_state_vector_einsum_evolution(self, dtype):
+        """
+        Test state vector einsum evolution with inverted & non-contiguous gate targets.
+        """
+        if dtype == "CuState":
+            import qutip_cuquantum
+            from cuquantum.densitymat import WorkStream
+
+            qutip_cuquantum.set_as_default(WorkStream())
+
+        try:
+            # 3-qubit circuit testing non-contiguous AND inverted target orderings:
+            # CX acting on (2, 0) and TOFFOLI acting on controls=[2, 0] -> target=1
+            qc = QubitCircuit(3)
+            qc.add_gate(gates.H, targets=0)
+            qc.add_gate(gates.CX, controls=2, targets=0)
+            qc.add_gate(gates.TOFFOLI, controls=[2, 0], targets=1)
+
+            init_state_cpu = tensor(basis(2, 0), basis(2, 0), basis(2, 1))
+            state = init_state_cpu.to(dtype)
+
+            sim = CircuitSimulator(qc, mode="state_vector_simulator")
+            result = sim.run(state)
+
+            final_state = result.get_final_states()[0]
+
+            assert type(final_state.data) is type(state.data)
+
+            # Switch back to CPU before computing analytical baseline matrices.
+            # Otherwise, expand_operator creates CuOperator instances where .permute()
+            # fails on non-contiguous/inverted targets (e.g. CX on [2, 0]).
+            if dtype == "CuState":
+                qutip_cuquantum.set_as_default(reverse=True)
+
+            U_H_exp = expand_operator(gates.H.get_qobj(), dims=[2, 2, 2], targets=0)
+            U_CX_exp = expand_operator(
+                gates.CX.get_qobj(), dims=[2, 2, 2], targets=[2, 0]
+            )
+            U_T_exp = expand_operator(
+                gates.TOFFOLI.get_qobj(), dims=[2, 2, 2], targets=[2, 0, 1]
+            )
+
+            expected_state = U_T_exp * U_CX_exp * U_H_exp * init_state_cpu
+            np.testing.assert_allclose(
+                final_state.full(), expected_state.full(), atol=1e-12
+            )
+
+        finally:
+            if dtype == "CuState":
+                qutip_cuquantum.set_as_default(reverse=True)
+
+    @pytest.mark.filterwarnings(
+        "ignore:ExternalStream is deprecated:DeprecationWarning"
+    )
+    @pytest.mark.parametrize("dtype", AVAILABLE_DTYPES)
+    def test_density_matrix_einsum_evolution(self, dtype):
+        """
+        Test density matrix einsum evolution with inverted & non-contiguous gate targets.
+        """
+        if dtype == "CuState":
+            import qutip_cuquantum
+            from cuquantum.densitymat import WorkStream
+
+            qutip_cuquantum.set_as_default(WorkStream())
+
+        try:
+            qc = QubitCircuit(3)
+            qc.add_gate(gates.H, targets=0)
+            qc.add_gate(gates.CX, controls=2, targets=0)
+            qc.add_gate(gates.TOFFOLI, controls=[2, 0], targets=1)
+
+            dm_init_cpu = ket2dm(tensor(basis(2, 0), basis(2, 0), basis(2, 1)))
+            dm_init = dm_init_cpu.to(dtype)
+
+            sim_dm = CircuitSimulator(qc, mode="density_matrix_simulator")
+            res_einsum = sim_dm.run(dm_init).get_final_states(0)
+
+            assert type(res_einsum.data) is type(dm_init.data)
+
+            # Switch back to CPU before computing analytical baseline matrices.
+            # Otherwise, expand_operator creates CuOperator instances where .permute()
+            # fails on non-contiguous/inverted targets (e.g. CX on [2, 0]).
+            if dtype == "CuState":
+                qutip_cuquantum.set_as_default(reverse=True)
+
+            U_H_exp = expand_operator(gates.H.get_qobj(), dims=[2, 2, 2], targets=0)
+            U_CX_exp = expand_operator(
+                gates.CX.get_qobj(), dims=[2, 2, 2], targets=[2, 0]
+            )
+            U_T_exp = expand_operator(
+                gates.TOFFOLI.get_qobj(), dims=[2, 2, 2], targets=[2, 0, 1]
+            )
+
+            expected_dm = (
+                U_T_exp
+                * U_CX_exp
+                * U_H_exp
+                * dm_init_cpu
+                * U_H_exp.dag()
+                * U_CX_exp.dag()
+                * U_T_exp.dag()
+            )
+
+            np.testing.assert_allclose(
+                res_einsum.full(), expected_dm.full(), atol=1e-12
+            )
+        finally:
+            if dtype == "CuState":
+                qutip_cuquantum.set_as_default(reverse=True)
+
+    @pytest.mark.filterwarnings(
+        "ignore:ExternalStream is deprecated:DeprecationWarning"
+    )
+    @pytest.mark.parametrize("dtype", AVAILABLE_DTYPES)
+    def test_operator_einsum_evolution(self, dtype):
+        """
+        Test unitary operator matrix propagation (is_oper=True) through einsum with inverted targets.
+        """
+        if dtype == "CuState":
+            pytest.skip(
+                "CuState is for quantum state vectors/DMs, not general full operator matrices"
+            )
+
+        qc = QubitCircuit(3)
+        qc.add_gate(gates.H, targets=0)
+        qc.add_gate(gates.CX, controls=2, targets=0)
+        qc.add_gate(gates.TOFFOLI, controls=[2, 0], targets=1)
+
+        init_oper_cpu = identity([2, 2, 2])
+        oper = init_oper_cpu.to(dtype)
+
+        sim = CircuitSimulator(qc, mode="state_vector_simulator")
+        res_einsum = sim.run(oper).get_final_states(0)
+
+        assert res_einsum.isoper
+        assert type(res_einsum.data) is type(oper.data)
+
+        U_H_exp = expand_operator(gates.H.get_qobj(), dims=[2, 2, 2], targets=0)
+        U_CX_exp = expand_operator(gates.CX.get_qobj(), dims=[2, 2, 2], targets=[2, 0])
+        U_T_exp = expand_operator(
+            gates.TOFFOLI.get_qobj(), dims=[2, 2, 2], targets=[2, 0, 1]
+        )
+
+        expected_oper = U_T_exp * U_CX_exp * U_H_exp * init_oper_cpu
+
+        np.testing.assert_allclose(res_einsum.full(), expected_oper.full(), atol=1e-12)
 
 
 class TestAddGateError:

@@ -2,10 +2,14 @@ from itertools import product
 from operator import mul
 from functools import reduce
 import numpy as np
+import string
 
 from qutip import ket2dm, Qobj
+from qutip.core import data as _data
+from qutip.core.dimensions import einsum
 from qutip_qip.circuit.simulator import CircuitResult
-from qutip_qip.operations import expand_operator
+from qutip_qip.operations import expand_operator, Gate
+from qutip_qip.typing import IntSequence
 
 
 def _decimal_to_binary(decimal, length):
@@ -99,9 +103,20 @@ class CircuitSimulator:
             else:
                 state = np.exp(1j * self.qc.global_phase) * state
                 self._state = state
+
+            # Reconstruct CuState with multipartite hilbert_dims for CuOperator mode mapping
+            if type(self._state.data).__name__ == "CuState":
+                from qutip_cuquantum.state import CuState as CuStateClass
+
+                hilbert_dims = tuple(state.dims[0])
+                self._state = Qobj(
+                    CuStateClass(self._state.data.to_cupy(), hilbert_dims=hilbert_dims),
+                    dims=self._state.dims,
+                )
         else:
             # Just computing the full unitary, no state
             self._state = None
+
         self._state_dims = state.dims.copy()  # Record the dimension of the state.
         self._probability = 1
         self._op_index = 0
@@ -248,6 +263,8 @@ class CircuitSimulator:
                 return
             if self.mode == "state_vector_simulator":
                 state = self._evolve_state_einsum(gate, qubits, current_state)
+            elif self.mode == "density_matrix_simulator":
+                state = self._evolve_state_einsum_dm(gate, qubits, current_state)
             else:
                 state = self._evolve_state(gate, qubits, current_state)
 
@@ -259,20 +276,147 @@ class CircuitSimulator:
         self._state = state
         self._op_index += 1
 
-    def _evolve_state(self, operation, targets_indices, state):
+    def _generate_einsum_eq(
+        self, targets: int | IntSequence, num_qubits: int, is_oper: bool = False
+    ) -> str:
         """
-        Applies unitary to state.
+        Generates the einsum string for tensor contraction supporting up to 52 qubits.
+        Uses standard ASCII letters (a-z, A-Z) to map input and output indices.
 
         Parameters
         ----------
-        U: Qobj
-            unitary to be applied.
+        targets : int or list of int
+            The target qubits the gate acts on.
+        num_qubits : int
+            The total number of qubits (tensor dimensions) in the state.
+        is_oper : bool, optional
+            Whether the state is an operator (e.g. unitary matrix) or ket vector.
+
+        Returns
+        -------
+        eq : str
+            The einsum equation string (e.g., "ab,cde->cde").
         """
-        U = operation.get_qobj()
+        if isinstance(targets, int):
+            targets = [targets]
+
+        chars = string.ascii_letters
+
+        row_in = list(chars[:num_qubits])
+        k = len(targets)
+        gate_out = list(chars[num_qubits : num_qubits + k])
+        gate_in = [row_in[t] for t in targets]
+
+        row_out = row_in.copy()
+        for i, t in enumerate(targets):
+            row_out[t] = gate_out[i]
+
+        sub_gate = "".join(gate_out + gate_in)
+
+        if is_oper:
+            col_in = list(chars[num_qubits + k : 2 * num_qubits + k])
+            sub_state = "".join(row_in + col_in)
+            sub_out = "".join(row_out + col_in)
+        else:
+            col_char = chars[num_qubits + k]
+            sub_state = "".join(row_in) + col_char
+            sub_out = "".join(row_out) + col_char
+
+        return f"{sub_gate},{sub_state}->{sub_out}"
+
+    def _generate_dm_einsum_eq(
+        self, targets: int | IntSequence, num_qubits: int
+    ) -> str:
+        r"""
+        Generates the einsum string for density matrix tensor contraction U rho U^\dagger.
+
+        Parameters
+        ----------
+        targets : int or list of int
+            The target qubits the gate acts on.
+        num_qubits : int
+            The total number of qubits in the state.
+
+        Returns
+        -------
+        eq : str
+            The einsum equation string (e.g., "ghac,abcdef,dfij->gbhiej").
+        """
+        if isinstance(targets, int):
+            targets = [targets]
+
+        chars = string.ascii_letters
+
+        row_in = list(chars[:num_qubits])
+        col_in = list(chars[num_qubits : 2 * num_qubits])
+
+        offset = 2 * num_qubits
+        k = len(targets)
+        gate_out_rows = list(chars[offset : offset + k])
+        gate_out_cols = list(chars[offset + k : offset + 2 * k])
+
+        gate_in_rows = [row_in[t] for t in targets]
+        gate_in_cols = [col_in[t] for t in targets]
+
+        row_out = row_in.copy()
+        col_out = col_in.copy()
+        for i, t in enumerate(targets):
+            row_out[t] = gate_out_rows[i]
+            col_out[t] = gate_out_cols[i]
+
+        sub_U = "".join(gate_out_rows + gate_in_rows)
+        sub_rho = "".join(row_in + col_in)
+        sub_Udag = "".join(gate_in_cols + gate_out_cols)
+        sub_out = "".join(row_out + col_out)
+
+        return f"{sub_U},{sub_rho},{sub_Udag}->{sub_out}"
+
+    def _evolve_state(
+        self, operation: Gate, targets_indices: int | IntSequence, state: Qobj
+    ) -> Qobj:
+        """
+         Applies a unitary gate to the quantum state using operator expansion.
+
+         Parameters
+         ----------
+        operation : :class:`.Gate`
+             The quantum gate to be applied.
+         targets_indices : int or sequence of int
+             The indices of the target qubits.
+         state : :class:`qutip.Qobj`
+             The current quantum state (ket or density matrix).
+
+         Returns
+         -------
+         state : :class:`qutip.Qobj`
+             The updated quantum state.
+        """
+        state_dtype = type(state.data).__name__
+        gate_dtype = "CuOperator" if state_dtype == "CuState" else state_dtype
+
+        # Construct CuOperator with explicit hilbert_dims and target mode mapping
+        # so cuQuantum knows which qubit sites to act on (calling .to('CuOperator')
+        # on raw gate Qobjs loses multipartite mode information).
+        if gate_dtype == "CuOperator":
+            from qutip_cuquantum.operator import CuOperator as CuOperatorClass
+
+            gate_qobj = operation.get_qobj()
+            U = Qobj(
+                CuOperatorClass(
+                    gate_qobj.data,
+                    hilbert_dims=tuple(gate_qobj.dims[0]),
+                    mode=tuple(range(len(gate_qobj.dims[0]))),
+                ),
+                dims=gate_qobj.dims,
+            )
+        else:
+            U = operation.get_qobj().to(gate_dtype)
+
         U = expand_operator(
             U,
             dims=self.dims,
             targets=targets_indices,
+            dtype=gate_dtype,
         )
         if self.mode == "state_vector_simulator":
             state = U * state
@@ -282,34 +426,93 @@ class CircuitSimulator:
             raise NotImplementedError(f"mode {self.mode} is not available.")
         return state
 
-    def _evolve_state_einsum(self, gate, targets_indices, state):
-        # Prepare the state tensor.
-        if isinstance(state, Qobj):
-            # If it is a Qobj, transform it to the array representation.
-            state = state.full()
-            # Transform the gate and state array to the corresponding
-            # tensor form.
-            state = state.reshape(self._tensor_dims)
+    def _evolve_state_einsum(
+        self, operation: Gate, targets_indices: int | IntSequence, state: Qobj
+    ) -> Qobj:
+        """
+        Applies a gate to the state using tensor contraction (einsum).
 
-        # Prepare the gate tensor.
-        gate = gate.get_qobj()
-        gate_array = gate.full().reshape(gate.dims[0] + gate.dims[1])
+        Parameters
+        ----------
+        operation : :class:`.Gate`
+            The quantum gate to be applied.
+        targets_indices : int or sequence of int
+            The indices of the target qubits.
+        state : :class:`qutip.Qobj`
+            The current quantum state vector or operator.
 
-        # Compute the tensor indices and call einsum.
-        num_site = len(state.shape)
-        ancillary_indices = range(num_site, num_site + len(targets_indices))
-        index_list = range(num_site)
-        new_index_list = list(index_list)
-        for j, k in enumerate(targets_indices):
-            new_index_list[k] = j + num_site
+        Returns
+        -------
+        state : :class:`qutip.Qobj`
+            The updated quantum state.
+        """
+        state_dtype = type(state.data).__name__
+        # There is no einsum specialisation registered for CuState/CuOperator, so einsum
+        # falls back to CPU NumPy. We route to matrix mul (_evolve_state) to stay on GPU.
+        if state_dtype == "CuState":
+            return self._evolve_state(operation, targets_indices, state)
 
-        state = np.einsum(
-            gate_array,
-            list(ancillary_indices) + list(targets_indices),
-            state,
-            index_list,
-            new_index_list,
+        gate_dtype = state_dtype
+
+        gate_qobj = operation.get_qobj().to(gate_dtype)
+
+        original_dims = state.dims
+        original_shape = state.shape
+
+        num_dims = len(self._state_dims[0])
+        is_oper = state.isoper
+        eq = self._generate_einsum_eq(targets_indices, num_dims, is_oper=is_oper)
+
+        malformed_state = einsum(eq, gate_qobj, state)
+        reshaped_data = _data.reshape(
+            malformed_state.data, original_shape[0], original_shape[1]
         )
+        state = Qobj(reshaped_data, dims=original_dims).to(state_dtype)
+
+        return state
+
+    def _evolve_state_einsum_dm(
+        self, operation: Gate, targets_indices: int | IntSequence, state: Qobj
+    ) -> Qobj:
+        """
+        Applies a gate to the density matrix state using tensor contraction (einsum).
+
+        Parameters
+        ----------
+        operation : :class:`.Gate`
+            The quantum gate to be applied.
+        targets_indices : int or sequence of int
+            The indices of the target qubits.
+        state : :class:`qutip.Qobj`
+            The current quantum density matrix state.
+
+        Returns
+        -------
+        state : :class:`qutip.Qobj`
+            The updated quantum density matrix state.
+        """
+        state_dtype = type(state.data).__name__
+        # There is no einsum specialisation registered for CuState/CuOperator, so einsum
+        # falls back to CPU NumPy. We route to matrix mul (_evolve_state) to stay on GPU.
+        if state_dtype == "CuState":
+            return self._evolve_state(operation, targets_indices, state)
+
+        gate_dtype = state_dtype
+
+        gate_qobj = operation.get_qobj().to(gate_dtype)
+
+        original_dims = state.dims
+        original_shape = state.shape
+
+        num_dims = len(self._state_dims[0])
+        eq = self._generate_dm_einsum_eq(targets_indices, num_dims)
+
+        malformed_state = einsum(eq, gate_qobj, state, gate_qobj.dag())
+        reshaped_data = _data.reshape(
+            malformed_state.data, original_shape[0], original_shape[1]
+        )
+        state = Qobj(reshaped_data, dims=original_dims).to(state_dtype)
+
         return state
 
     def _apply_measurement(self, operation, qubits, cbits):
