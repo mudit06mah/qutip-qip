@@ -1009,6 +1009,43 @@ class TestEinsumBackend:
 
         np.testing.assert_allclose(res_einsum.full(), expected_oper.full(), atol=1e-12)
 
+    @pytest.mark.filterwarnings(
+        "ignore:ExternalStream is deprecated:DeprecationWarning"
+    )
+    @pytest.mark.parametrize("dtype", AVAILABLE_DTYPES)
+    def test_measurement_einsum_evolution(self, dtype):
+        """
+        Test measurement einsum evolution across backends (Dense, JAX, CuState).
+        """
+        if dtype == "CuState":
+            import qutip_cuquantum
+            from cuquantum.densitymat import WorkStream
+
+            qutip_cuquantum.set_as_default(WorkStream())
+
+        try:
+            qc = QubitCircuit(2, num_cbits=1)
+            qc.add_gate(gates.H, targets=0)
+            qc.add_gate(gates.CX, controls=0, targets=1)
+            qc.add_measurement(Mz, targets=[0], classical_store=0)
+
+            init_state = tensor(basis(2, 0), basis(2, 0)).to(dtype)
+            sim = CircuitSimulator(qc, mode="state_vector_simulator")
+            result = sim.run(init_state)
+
+            final_state = result.get_final_states()[0]
+            assert type(final_state.data) is type(init_state.data)
+            assert sim.cbits[0] in (0, 1)
+
+            if sim.cbits[0] == 0:
+                expected = tensor(basis(2, 0), basis(2, 0))
+            else:
+                expected = tensor(basis(2, 1), basis(2, 1))
+            np.testing.assert_allclose(final_state.full(), expected.full(), atol=1e-12)
+        finally:
+            if dtype == "CuState":
+                qutip_cuquantum.set_as_default(reverse=True)
+
 
 class TestAddGateError:
     def test_add_gate_errors(self):
@@ -1229,117 +1266,3 @@ def test_gates_class():
     result2 = circuit2.run(init_state)
 
     assert pytest.approx(qutip.fidelity(result1, result2), 1.0e-6) == 1
-
-
-try:
-    import qutip_cuquantum
-
-    HAS_CUQANTUM = True
-except ImportError:
-    HAS_CUQANTUM = False
-
-
-class TestCuQuantumBackend:
-    @pytest.mark.skipif(not HAS_CUQANTUM, reason="qutip_cuquantum not installed")
-    @pytest.mark.filterwarnings(
-        "ignore:ExternalStream is deprecated:DeprecationWarning"
-    )
-    def test_cuquantum_state_vector_simulator(self):
-        """Test state_vector_simulator mode with CuState on GPU."""
-        import qutip_cuquantum
-        from cuquantum.densitymat import WorkStream
-
-        ctx = WorkStream()
-        qutip_cuquantum.set_as_default(ctx)
-        try:
-            qc = QubitCircuit(2)
-            qc.add_gate(gates.H, targets=0)
-            qc.add_gate(gates.CX, controls=0, targets=1)
-
-            state = tensor(basis(2, 0), basis(2, 0)).to("CuState")
-            sim = CircuitSimulator(qc, mode="state_vector_simulator")
-            result = sim.run(state)
-
-            final_state = result.get_final_states()[0]
-            assert type(final_state.data).__name__ == "CuState"
-
-            expected = (
-                tensor(basis(2, 0), basis(2, 0)) + tensor(basis(2, 1), basis(2, 1))
-            ).unit()
-            np.testing.assert_allclose(final_state.full(), expected.full(), atol=1e-12)
-        finally:
-            qutip_cuquantum.set_as_default(reverse=True)
-
-    @pytest.mark.skipif(not HAS_CUQANTUM, reason="qutip_cuquantum not installed")
-    @pytest.mark.filterwarnings(
-        "ignore:ExternalStream is deprecated:DeprecationWarning"
-    )
-    def test_cuquantum_density_matrix_simulator(self):
-        """Test density_matrix_simulator mode with CuState on GPU."""
-        import qutip_cuquantum
-        from cuquantum.densitymat import WorkStream
-
-        ctx = WorkStream()
-        qutip_cuquantum.set_as_default(ctx)
-        try:
-            qc = QubitCircuit(2)
-            qc.add_gate(gates.H, targets=0)
-            qc.add_gate(gates.CX, controls=0, targets=1)
-
-            pure_state = tensor(basis(2, 0), basis(2, 0)).to("CuState")
-            state = ket2dm(pure_state)
-            assert type(state.data).__name__ == "CuState"
-
-            sim = CircuitSimulator(qc, mode="density_matrix_simulator")
-            result = sim.run(state)
-
-            final_state = result.get_final_states()[0]
-            assert type(final_state.data).__name__ == "CuState"
-
-            expected = ket2dm(
-                (
-                    tensor(basis(2, 0), basis(2, 0)) + tensor(basis(2, 1), basis(2, 1))
-                ).unit()
-            )
-            np.testing.assert_allclose(final_state.full(), expected.full(), atol=1e-12)
-        finally:
-            qutip_cuquantum.set_as_default(reverse=True)
-
-    @pytest.mark.skipif(not HAS_CUQANTUM, reason="qutip_cuquantum not installed")
-    @pytest.mark.filterwarnings(
-        "ignore:ExternalStream is deprecated:DeprecationWarning"
-    )
-    def test_cuquantum_measurement(self):
-        """Test measurement simulator mode with CuState on GPU."""
-        import qutip_cuquantum
-        from cuquantum.densitymat import WorkStream
-        from qutip_qip.operations.measurement import Mz
-
-        ctx = WorkStream()
-        qutip_cuquantum.set_as_default(ctx)
-        try:
-            qc = QubitCircuit(2, num_cbits=1)
-            qc.add_gate(gates.H, targets=0)
-            qc.add_gate(gates.CX, controls=0, targets=1)
-            # Add measurement on qubit 0
-            qc.add_measurement(Mz, targets=[0], classical_store=0)
-
-            state = tensor(basis(2, 0), basis(2, 0)).to("CuState")
-            sim = CircuitSimulator(qc, mode="state_vector_simulator")
-            result = sim.run(state)
-
-            final_state = result.get_final_states()[0]
-            # Ensure type is preserved as CuState
-            assert type(final_state.data).__name__ == "CuState"
-
-            # Check that classical bit register was set to 0 or 1
-            assert sim.cbits[0] in (0, 1)
-
-            # Check correctness: final state should be either |00> or |11>
-            if sim.cbits[0] == 0:
-                expected = tensor(basis(2, 0), basis(2, 0))
-            else:
-                expected = tensor(basis(2, 1), basis(2, 1))
-            np.testing.assert_allclose(final_state.full(), expected.full(), atol=1e-12)
-        finally:
-            qutip_cuquantum.set_as_default(reverse=True)

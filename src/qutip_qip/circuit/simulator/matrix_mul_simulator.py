@@ -4,16 +4,13 @@ from functools import reduce
 from typing import Type
 import string
 import numpy as np
-import string
 
-from qutip import ket2dm, Qobj
-from qutip.core import data as _data
-from qutip.core.dimensions import einsum
+from qutip import ket2dm, Qobj, einsum
+from qutip.settings import settings
 from qutip.measurement import measurement_statistics
 from qutip_qip.circuit.simulator import CircuitResult
 from qutip_qip.operations import expand_operator, Gate, Measurement
 from qutip_qip.typing import IntSequence
-from qutip_qip.circuit.simulator import CircuitResult
 
 
 def _decimal_to_binary(decimal, length):
@@ -286,7 +283,11 @@ class CircuitSimulator:
         self._op_index += 1
 
     def _generate_einsum_eq(
-        self, targets: int | IntSequence, num_qubits: int, is_oper: bool = False
+        self,
+        targets: int | IntSequence,
+        num_qubits: int,
+        num_cols: int = 1,
+        is_oper: bool = False,
     ) -> str:
         """
         Generates the einsum string for tensor contraction supporting up to 52 qubits.
@@ -298,6 +299,8 @@ class CircuitSimulator:
             The target qubits the gate acts on.
         num_qubits : int
             The total number of qubits (tensor dimensions) in the state.
+        num_cols : int, optional
+            The number of column dimensions in the state representation.
         is_oper : bool, optional
             Whether the state is an operator (e.g. unitary matrix) or ket vector.
 
@@ -322,14 +325,12 @@ class CircuitSimulator:
 
         sub_gate = "".join(gate_out + gate_in)
 
-        if is_oper:
-            col_in = list(chars[num_qubits + k : 2 * num_qubits + k])
-            sub_state = "".join(row_in + col_in)
-            sub_out = "".join(row_out + col_in)
-        else:
-            col_char = chars[num_qubits + k]
-            sub_state = "".join(row_in) + col_char
-            sub_out = "".join(row_out) + col_char
+        if is_oper and num_cols == 1:
+            num_cols = num_qubits
+
+        col_in = list(chars[num_qubits + k : num_qubits + k + num_cols])
+        sub_state = "".join(row_in + col_in)
+        sub_out = "".join(row_out + col_in)
 
         return f"{sub_gate},{sub_state}->{sub_out}"
 
@@ -381,15 +382,15 @@ class CircuitSimulator:
         return f"{sub_U},{sub_rho},{sub_Udag}->{sub_out}"
 
     def _evolve_state(
-        self, operation: Gate, targets_indices: int | IntSequence, state: Qobj
+        self, operation: Gate | Qobj, targets_indices: int | IntSequence, state: Qobj
     ) -> Qobj:
         """
          Applies a unitary gate to the quantum state using operator expansion.
 
          Parameters
          ----------
-        operation : :class:`.Gate`
-             The quantum gate to be applied.
+        operation : :class:`.Gate` or :class:`qutip.Qobj`
+             The quantum gate or operator to be applied.
          targets_indices : int or sequence of int
              The indices of the target qubits.
          state : :class:`qutip.Qobj`
@@ -406,10 +407,12 @@ class CircuitSimulator:
         # Construct CuOperator with explicit hilbert_dims and target mode mapping
         # so cuQuantum knows which qubit sites to act on (calling .to('CuOperator')
         # on raw gate Qobjs loses multipartite mode information).
+        gate_qobj = (
+            operation.get_qobj() if hasattr(operation, "get_qobj") else operation
+        )
         if gate_dtype == "CuOperator":
             from qutip_cuquantum.operator import CuOperator as CuOperatorClass
 
-            gate_qobj = operation.get_qobj()
             U = Qobj(
                 CuOperatorClass(
                     gate_qobj.data,
@@ -419,7 +422,7 @@ class CircuitSimulator:
                 dims=gate_qobj.dims,
             )
         else:
-            U = operation.get_qobj().to(gate_dtype)
+            U = gate_qobj.to(gate_dtype)
 
         U = expand_operator(
             U,
@@ -465,20 +468,14 @@ class CircuitSimulator:
 
         gate_qobj = operation.get_qobj().to(gate_dtype)
 
-        original_dims = state.dims
-        original_shape = state.shape
-
         num_dims = len(self._state_dims[0])
+        num_cols = len(state.dims[1])
         is_oper = state.isoper
-        eq = self._generate_einsum_eq(targets_indices, num_dims, is_oper=is_oper)
-
-        malformed_state = einsum(eq, gate_qobj, state)
-        reshaped_data = _data.reshape(
-            malformed_state.data, original_shape[0], original_shape[1]
+        eq = self._generate_einsum_eq(
+            targets_indices, num_dims, num_cols=num_cols, is_oper=is_oper
         )
-        state = Qobj(reshaped_data, dims=original_dims).to(state_dtype)
 
-        return state
+        return einsum(eq, gate_qobj, state)
 
     def _evolve_state_einsum_dm(
         self, operation: Gate, targets_indices: int | IntSequence, state: Qobj
@@ -510,19 +507,10 @@ class CircuitSimulator:
 
         gate_qobj = operation.get_qobj().to(gate_dtype)
 
-        original_dims = state.dims
-        original_shape = state.shape
-
         num_dims = len(self._state_dims[0])
         eq = self._generate_dm_einsum_eq(targets_indices, num_dims)
 
-        malformed_state = einsum(eq, gate_qobj, state, gate_qobj.dag())
-        reshaped_data = _data.reshape(
-            malformed_state.data, original_shape[0], original_shape[1]
-        )
-        state = Qobj(reshaped_data, dims=original_dims).to(state_dtype)
-
-        return state
+        return einsum(eq, gate_qobj, state, gate_qobj.dag())
 
     def _apply_measurement(
         self,
@@ -585,12 +573,27 @@ class CircuitSimulator:
 
     def _apply_measurement_einsum(
         self,
-        operation: Measurement,
+        operation: Measurement | Type[Measurement],
         qubits: tuple[int, ...],
         cbits: tuple[int, ...],
     ) -> Qobj:
         """
         Applies measurement gate specified by operation using tensor contraction (einsum).
+
+        Parameters
+        ----------
+        operation : :class:`.Measurement` or Type[:class:`.Measurement`]
+            Measurement gate in a circuit object or its class.
+        qubits : tuple of int
+            The indices of the qubits to be measured.
+        cbits : tuple of int
+            The indices of the classical registers where the measurement
+            results will be stored.
+
+        Returns
+        -------
+        state : :class:`qutip.Qobj`
+            The collapsed state after the measurement.
         """
         current_state = self.state
         num_qubits = self.qc.num_qubits
@@ -598,17 +601,20 @@ class CircuitSimulator:
             operation = operation()
 
         state_dtype = type(current_state.data).__name__
-        op_dtype = "CuOperator" if state_dtype == "CuState" else state_dtype
+        raw_ops = operation.get_measurement_ops()
+        # Ops for CuState are converted to CuOperator in _evolve_state()
+        if state_dtype != "CuState":
+            raw_ops = [op.to(state_dtype) for op in raw_ops]
 
-        raw_ops = [op.to(op_dtype) for op in operation.get_measurement_ops()]
+        num_cols = len(current_state.dims[1])
 
         states = []
         probabilities = []
-        tol = qutip.settings.core["atol"]
+        tol = settings.core["atol"]
 
         if self.mode == "state_vector_simulator":
             eq = self._generate_einsum_eq(
-                qubits, num_qubits, is_oper=current_state.isoper
+                qubits, num_qubits, num_cols=num_cols, is_oper=current_state.isoper
             )
 
             for op in raw_ops:
